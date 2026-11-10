@@ -330,6 +330,7 @@
           font-size: 13px;
           color: #f4dbac;
         }
+        body.immersive #world canvas { cursor: none; }
         body.immersive #viewport > *:not(#world) {
           display: none !important;
         }
@@ -442,10 +443,10 @@
             mengubah sakelar. R kembali ke meja awal.
           </dd>
           <dt>Gamepad</dt>
-          <dd>Stik kiri untuk berjalan, stik kanan untuk melihat. Tekan A / Cross saat penanda hijau.</dd>
+          <dd>Stik kiri untuk berjalan. Dalam VR di HP, arahkan pandangan ke sakelar, lalu tekan A / Cross saat sakelar ditandai hijau. Geser stik kanan ke samping untuk berputar.</dd>
           <dt>Headset VR</dt>
           <dd>
-            Stik kiri untuk berjalan. Arahkan laser lalu tekan trigger. Tekan grip untuk membuka peta dan
+            Stik kiri untuk berjalan. Arahkan controller ke sakelar lalu tekan trigger. Tekan grip untuk membuka peta dan
             memilih meja.
           </dd>
         </dl>
@@ -2306,7 +2307,8 @@
             x /= size;
             y /= size;
             const cameraNow = isXR() ? scene.renderer.xr.getCamera() : camera();
-            cameraNow.getWorldDirection(dir);
+            if (isXR()) dir.set(0, 0, -1).transformDirection(cameraNow.matrixWorld);
+            else cameraNow.getWorldDirection(dir);
             dir.y = 0;
             if (dir.lengthSq() < 0.0001) return;
             dir.normalize();
@@ -2315,7 +2317,8 @@
               dx = (-dir.z * x - dir.x * y) * d,
               dz = (dir.x * x - dir.z * y) * d;
             // Use the viewer's actual horizontal position for room-scale headsets.
-            cameraNow.getWorldPosition(eye);
+            if (isXR()) eye.setFromMatrixPosition(cameraNow.matrixWorld);
+            else cameraNow.getWorldPosition(eye);
             if (allowed(eye.x + dx, eye.z)) {
               p.x += dx;
               eye.x += dx;
@@ -2409,7 +2412,7 @@
             };
           }
           document.addEventListener("keydown", (e) => {
-            if (guide.open || e.altKey || e.ctrlKey || e.metaKey || isXR()) return;
+            if (guide.open || e.altKey || e.ctrlKey || e.metaKey) return;
             const k = e.key.toLowerCase(),
               confirm = k === "enter" || k === " ";
             if (!started) {
@@ -2419,7 +2422,7 @@
               }
               return;
             }
-            if (confirm && e.target?.closest?.("a,button")) return;
+            if (confirm && !isXR() && e.target?.closest?.("a,button")) return;
             if (
               walking &&
               ["w", "a", "s", "d", "arrowup", "arrowdown", "arrowleft", "arrowright"].includes(k)
@@ -2429,10 +2432,14 @@
             }
             if (k === "e" || confirm) {
               e.preventDefault();
-              if (!e.repeat && walking) interact();
+              if (!e.repeat && walking) {
+                if (isXR()) xrActivate(headHit());
+                else interact();
+              }
             }
             if (!e.repeat && k === "m") {
-              if (walking) map();
+              if (isXR()) showXrMap();
+              else if (walking) map();
               else visit(active);
             }
             if (!e.repeat && k === "r") visit(startStation);
@@ -2441,23 +2448,30 @@
           window.addEventListener("blur", resetInput);
           document.addEventListener("visibilitychange", resetInput);
           const dead = (v) => (Math.abs(v || 0) < 0.16 ? 0 : v);
-          function padInput() {
+          function padInput(sources) {
             let pads;
             try {
               pads = navigator.getGamepads?.();
             } catch {}
-            return pads ? Array.from(pads).find((p) => p?.connected && p.mapping === "standard") : null;
+            const external = Array.from(pads || []).filter((p) =>
+              p && p.connected !== false && p.mapping !== "xr-standard" &&
+              !sources.some((source) => source.gamepad === p)
+            );
+            return external.find((p) => p.axes.some(dead) || p.buttons.some((b) => b.pressed)) || external[0];
           }
           function tick(dt) {
-            if (!loaded || guide.open || document.hidden) return;
-            if (isXR()) {
-              xrTick(dt);
-              return;
-            }
-            const pad = padInput(),
+            if (!loaded || guide.open) return;
+            const immersive = isXR();
+            if (immersive ? scene.renderer.xr.getSession()?.visibilityState === "hidden" : document.hidden) return;
+            const sources = immersive ? Array.from(scene.renderer.xr.getSession()?.inputSources || []) : [];
+            const pad = padInput(sources),
               press = !!(pad?.buttons[0]?.pressed || pad?.buttons[7]?.pressed),
               rising = press && !padPressed;
             padPressed = press;
+            if (immersive) {
+              xrTick(dt, sources, pad, rising);
+              return;
+            }
             if (!walking) {
               if (rising) visit(active);
               return;
@@ -2556,8 +2570,8 @@
               return;
             }
             const head = scene.renderer.xr.getCamera();
-            head.getWorldPosition(eye);
-            head.getWorldDirection(dir);
+            eye.setFromMatrixPosition(head.matrixWorld);
+            dir.set(0, 0, -1).transformDirection(head.matrixWorld);
             dir.y = 0;
             if (dir.lengthSq() < 0.01) dir.set(0, 0, -1);
             dir.normalize();
@@ -2567,9 +2581,14 @@
             xrMap.visible = true;
             xrMap.updateWorldMatrix(true, true);
           }
-          function xrSelect(controller) {
-            if (!isXR()) return;
-            const hit = controllerHit(controller);
+          function headHit() {
+            const viewMatrix = scene.renderer.xr.getCamera().matrixWorld;
+            rays.ray.origin.setFromMatrixPosition(viewMatrix);
+            rays.ray.direction.set(0, 0, -1).transformDirection(viewMatrix);
+            rays.far = 3.6;
+            return rays.intersectObjects(xrMap.visible ? mapTargets : targets, false)[0];
+          }
+          function xrActivate(hit) {
             if (!hit) return;
             if (!xrMap.visible) {
               toggle(hit);
@@ -2578,8 +2597,8 @@
             const s = hit.object.userData.destination,
               head = scene.renderer.xr.getCamera(),
               p = rig.object3D.position;
-            head.getWorldPosition(eye);
-            head.getWorldDirection(dir);
+            eye.setFromMatrixPosition(head.matrixWorld);
+            dir.set(0, 0, -1).transformDirection(head.matrixWorld);
             const facing = Math.atan2(-dir.x, -dir.z);
             const angle = 0.22 - facing,
               dx = p.x - eye.x,
@@ -2597,32 +2616,20 @@
             for (let i = 0; i < 2; i++) {
               const controller = scene.renderer.xr.getController(i);
               rig.object3D.add(controller);
-              const laser = new T.Mesh(
-                new T.CylinderGeometry(0.005, 0.008, 1, 6),
-                materials("#a9f8c7", true),
-              );
-              laser.rotation.x = Math.PI / 2;
-              laser.position.z = -0.6;
-              controller.add(laser);
               const handle = new T.Mesh(new T.CapsuleGeometry(0.031, 0.085, 3, 8), materials("#657b74"));
               handle.position.set(0, -0.028, 0.025);
               handle.rotation.x = -0.45;
+              handle.visible = false;
               controller.add(handle);
-              const end = new T.Mesh(ball, materials("#a9f8c7", true));
-              end.scale.setScalar(0.011);
-              controller.add(end);
-              controller.addEventListener("selectstart", () => xrSelect(controller));
+              controller.addEventListener("connected", (e) => {
+                handle.visible = e.data?.targetRayMode === "tracked-pointer";
+              });
+              controller.addEventListener("disconnected", () => { handle.visible = false; });
+              controller.addEventListener("selectstart", (e) => {
+                if (isXR()) xrActivate(e.data?.targetRayMode === "gaze" ? headHit() : controllerHit(controller));
+              });
               controller.addEventListener("squeezestart", showXrMap);
-              // Di HP (input layar/gaze) tidak ada kontroler fisik, jadi model
-              // pegangan dan laser disembunyikan agar tidak menghalangi pandangan.
-              const parts = [laser, handle, end];
-              const showParts = (on) => parts.forEach((p) => (p.visible = on));
-              showParts(false);
-              controller.addEventListener("connected", (e) =>
-                showParts(e.data?.targetRayMode === "tracked-pointer"),
-              );
-              controller.addEventListener("disconnected", () => showParts(false));
-              controllers.push({ controller, laser, end });
+              controllers.push(controller);
             }
           }
           function controllerHit(c) {
@@ -2632,10 +2639,8 @@
             rays.far = 3.6;
             return rays.intersectObjects(xrMap.visible ? mapTargets : targets, false)[0];
           }
-          function xrTick(dt) {
-            const session = scene.renderer.xr.getSession(),
-              sources = Array.from(session?.inputSources || []),
-              left =
+          function xrTick(dt, sources, pad, activate) {
+            const left =
                 sources.find((s) => s.handedness === "left" && s.gamepad) || sources.find((s) => s.gamepad),
               right = sources.find((s) => s.handedness === "right" && s.gamepad);
             const stick = (s) => {
@@ -2644,13 +2649,23 @@
                 ? [dead(a[2]) || dead(a[0]), dead(a[3]) || dead(a[1])]
                 : [dead(a[0]), dead(a[1])];
             };
-            const [x, y] = stick(left),
-              [turn] = stick(right);
+            const axes = pad?.axes || [];
+            let [x, y] = stick(left);
+            if (!x && !y) {
+              x = dead(axes[0]);
+              y = dead(axes[1]);
+            }
+            if (!x && !y) {
+              x = Number(keys.has("d") || keys.has("arrowright")) - Number(keys.has("a") || keys.has("arrowleft"));
+              y = Number(keys.has("s") || keys.has("arrowdown")) - Number(keys.has("w") || keys.has("arrowup"));
+            }
+            const turn = (right && left !== right ? stick(right)[0] : 0) || dead(axes[2]);
+            if (activate) xrActivate(headHit());
             if (!xrMap.visible && (x || y)) move(x, y, dt);
-            if (!xrMap.visible && right && left !== right && Math.abs(turn) > 0.72 && !turnLatched) {
+            if (!xrMap.visible && Math.abs(turn) > 0.72 && !turnLatched) {
               const head = scene.renderer.xr.getCamera(),
                 p = rig.object3D.position;
-              head.getWorldPosition(eye);
+              eye.setFromMatrixPosition(head.matrixWorld);
               const angle = (-Math.sign(turn) * Math.PI) / 6,
                 dx = p.x - eye.x,
                 dz = p.z - eye.z;
@@ -2660,19 +2675,17 @@
               turnLatched = true;
             }
             if (Math.abs(turn) < 0.35) turnLatched = false;
-            let pointed = null;
-            for (const { controller, laser, end } of controllers) {
-              if (!controller.visible) continue;
-              const hit = controllerHit(controller),
-                d = hit ? hit.distance : 2.25;
-              laser.material = end.material = materials(hit ? "#46f5a2" : "#edf3ed", true);
-              laser.scale.y = d;
-              laser.position.z = -d / 2;
-              end.position.z = -d;
-              end.scale.setScalar(hit ? 0.019 : 0.009);
-              if (hit && !xrMap.visible) pointed = hit;
+            let pointed = pad || !sources.some((source) => source.targetRayMode === "tracked-pointer") ? headHit() : null;
+            if (xrMap.visible) for (const marker of mapTargets) marker.material.color.setScalar(1);
+            if (xrMap.visible && pointed) pointed.object.material.color.setScalar(1.65);
+            for (const controller of controllers) {
+              if (!controller.visible || !controller.children[0]?.visible) continue;
+              const hit = controllerHit(controller);
+              if (!hit) continue;
+              if (xrMap.visible) hit.object.material.color.setScalar(1.65);
+              else pointed ||= hit;
             }
-            markTarget(pointed);
+            markTarget(xrMap.visible ? null : pointed);
           }
           $("#headset").onclick = async () => {
             try {
